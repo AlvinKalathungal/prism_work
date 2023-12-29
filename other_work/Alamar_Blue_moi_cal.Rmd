@@ -1,0 +1,343 @@
+---
+title: "Alamar_Blue_Be_Mathing"
+output: html_document
+date: "2023-04-06"
+---
+
+#Written by Alvin Kalathungal and Ashish George
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE,cache = TRUE, warning = FALSE, message = FALSE) ## to save intermediate files and make knitting quicker, not show code or warnings
+```
+
+## R Markdown
+
+```{r}
+#install.packages("dplyr")
+library(dplyr)
+#install.packages("tidyverse")
+library(tidyverse)
+#install.packages("openxlsx")
+library(openxlsx)
+#install.packages("ggplot2")
+library(ggplot2)
+#install.packages("ggpmisc")
+library(ggpmisc)
+#install.packages("magrittr")
+library(magrittr)
+#install.packages("readxl")
+library(readxl)
+```
+
+
+only the date of the file needs to inputted and the input and output files are automatically named. Files would need to follow the same naming convention for this to work in the future.
+
+
+# read and organize data
+renames columns, splits data into standard and not, computes log10 values
+```{r}
+
+## change the date to reflect metadata date
+
+date_of_file="20230721" ## date of metadata file used to add unique index plots and output files
+
+input_file_name <- paste0("Alamar_Blue_Titer_Metadata_",date_of_file,".xlsx")
+output_file_name <- paste0("Alamar_Blue_Titer_Predictions_",date_of_file,".xlsx")
+
+#getwd()
+
+
+Alamar_Blue_Titer_Metadata <- readxl::read_excel(input_file_name)
+# "Alamar_Blue_Titer_Metadata_20230223.xlsx"
+
+# Import metadata sheet & change naming scheme so R can work
+data <- Alamar_Blue_Titer_Metadata %>% 
+  rename(cell_count = `Cell Count`,sample_name = `Sample Name`, viral_volume = `Viral Volume`, puro_selection = `Puro selection`) %>% mutate(Fluorescence = as.numeric(Fluorescence), cell_count = as.numeric(cell_count)) 
+
+
+#Grab all the standards to model curve
+standard_set <- data %>% filter(grepl("Standard", sample_name)) %>% na.omit()
+standard_set <- standard_set %>% mutate(log_fl = log10(Fluorescence)) %>% mutate(log_cell = log10(cell_count))
+
+#grab all the non-standards(Samples)
+data_set <- data %>% filter(!grepl("Standard",sample_name))
+data_set <- data_set %>% drop_na(Fluorescence) %>% mutate(log_fl = log10(Fluorescence))
+
+# 
+target_moi_for_plots <- c(0.1,0.2, 0.3, 0.4, 0.5, 1.0, 1.5, 2.0) 
+target_moi_for_report <- c(0.5, 1.0, 1.5, 2.0) 
+```
+## Plot standard curve to evaluate if the log-log is fit well by a linear model
+-- need to add error if fit is not good.
+```{r}
+#Plot Standard to see if it is linear on log-log
+standard_set %>% ggplot(aes(log_fl,log_cell)) + stat_poly_eq() +geom_point() + geom_smooth(method = 'glm')  
+ggsave(paste0("std_curve_",date_of_file,".png" ))
+
+
+#Make Model from standards
+linear_model <-  glm(standard_set$log_cell~standard_set$log_fl, data = standard_set) 
+# verify if fit is good
+# have R^2 value and formula
+
+#Grab the m and b from y=mx + b
+intercept_model <- coef(linear_model)[1]
+slope_model <- coef(linear_model)[2]
+
+#have IF statements to check for R^2 is less than .8. To stop the program/notify user. 
+#potiental outlier
+#Have some info on how comfortable we are with the fl reading range downstream
+```
+## predict cell counts from alamar blue fluorescence based on above
+
+-- add a flag if we are extrapolating the curve far out of the measured range in the standard curve. 
+
+```{r}
+# create predicted cell counts 
+predicted_set <- data_set %>% mutate(predicted_cell_log = log_fl*slope_model + intercept_model)
+
+#plot log_fl to log_predicted_cell
+# predicted_set %>% ggplot(aes(log_fl,predicted_cell_log)) + geom_point()
+
+#convert predicted counts to not be log form
+predicted_set <- predicted_set %>% mutate(predicted_cell_count = 10^predicted_cell_log) %>% drop_na(predicted_cell_count)
+# head(predicted_set)
+
+#think about flagging / potiential errors in making this curve. If the FL value was out of range, it should be flagged
+
+```
+
+
+### calculate lambda, the average MOI for each input viral volume
+
+```{r}
+# Ask about replicates, NIC exact same values for PURO selection.
+# get the ratio for those who survived treatment, versus no treatment and get MOI from it
+#*** filter out NIC
+
+predicted_set %>% group_by(sample_name,Dilution, viral_volume, Rep) %>% summarise(ratio = sum(predicted_cell_count[puro_selection == "Yes"], na.rm = TRUE) / sum(predicted_cell_count[puro_selection == "No"],na.rm = TRUE)) %>% mutate(MOI = -log(1 - ratio)) %>% filter(sample_name != "NIC") %>% group_by(sample_name,viral_volume) -> lambda_set
+
+
+lambda_set <- na.omit(lambda_set)
+
+#Making copies to run each model
+linear_model_set <- lambda_set %>% filter(MOI > 0.001)
+log_model_set <- lambda_set %>% filter(MOI > 0.001)
+
+head(lambda_set)
+
+
+
+## target_moi_for_plots <- c(min(lambda_set$MOI),target_moi_for_plots) ## will predict for the smallest moi as well to conveniently draw lines
+
+
+```
+# predict viral volume for desired MOI
+
+## Linear Model of MOI vs input viral volume
+
+```{r}
+# Ploting the linear model via boxplots
+linear_model_set %>%  ggplot((aes(x = viral_volume, y= MOI, group = viral_volume))) + facet_wrap(~sample_name) +geom_boxplot()
+```
+
+
+
+```{r}
+#grabbing all the names in the list 
+data_split_linear <- split(linear_model_set, linear_model_set$sample_name)
+models_linear <- list()
+sample_names_linear <- names(data_split_linear)
+
+#creating a model for linear set
+
+for (i in seq_along(data_split_linear)) {
+  models_linear[[sample_names_linear[i]]] <- lm(MOI~viral_volume , data = data_split_linear[[i]])
+}
+```
+
+
+
+```{r}
+#creating a new data frame with desired MOIs
+## making only upto 2.
+
+new_data <- data.frame(moi = target_moi_for_plots)
+
+predictions <- list()
+
+
+sample_names_linear <- names(data_split_linear)
+
+
+for (i in seq_along(models_linear)) {
+  # Extract the coefficients from the model
+  coefs <- coef(models_linear[[i]])
+  
+  # Calculate the predicted log_volume values
+  predictions[[sample_names_linear[i]]] <- (new_data$moi - coefs[1])/ coefs[2] 
+}
+
+
+```
+
+
+```{r}
+sample_names_linear <- names(predictions) 
+
+# Create a data frame with the sample names and the associated predictions
+linear_results <- data.frame(sample_names = rep(sample_names_linear, each = nrow(new_data)),
+                      moi = rep(new_data$moi, times = length(sample_names_linear)),
+                      volume_linear_model = unlist(predictions))
+```
+
+
+
+## Log-log fit of MOI vs viral volume
+```{r}
+log_model_set <- log_model_set %>% mutate(log_MOI = log10(MOI)) %>% mutate(log_volume = log10(viral_volume))
+
+log_model_set %>% ggplot((aes(x = log_volume, y= log_MOI, group = viral_volume))) + facet_wrap(~sample_name) +geom_boxplot()
+
+```
+
+```{r}
+data_split_log <- split(log_model_set, log_model_set$sample_name)
+models_log <- list()
+
+sample_names <- names(data_split_log)
+
+
+for (i in seq_along(data_split_log)) {
+  models_log[[sample_names[i]]] <- lm(I(log_MOI-1*log_volume) ~ 1, data = data_split_log[[i]])
+}
+
+```
+
+
+```{r}
+new_data_log <- data.frame(
+  log_MOI = log10(target_moi_for_plots),
+  moi=target_moi_for_plots)
+
+predictions_log <- list()
+
+sample_names <- names(data_split_log)
+
+for (i in seq_along(models_log)) {
+  # Extract the coefficients from the model
+  coefs <- coef(models_log[[i]])
+  
+  # Calculate the predicted log_volume values
+  predictions_log[[sample_names[i]]] <- new_data_log$log_MOI - coefs[1]
+}
+
+```
+
+
+
+```{r}
+sample_names <- names(predictions_log)
+
+# Create a data frame with the sample names and the associated predictions
+log_results_set <- data.frame(sample_names = rep(sample_names, each = nrow(new_data_log)),
+                      log_moi = rep(new_data_log$log_MOI, times = length(sample_names)),
+                      moi=rep(new_data_log$moi, times = length(sample_names)),
+                      log_volume = unlist(predictions_log))
+
+
+```
+
+
+
+```{r}
+#reverting log values to tangible real world values for lab use
+log_results <- log_results_set %>% mutate(volume_log_model = 10^(log_volume))#, moi= 10^(log_moi))
+
+#combining linear model and log model dataset into one table
+all_results <- left_join(linear_results,log_results, by=c('sample_names','moi')) 
+
+# removing log_moi and log_volume for concise data. Still will exist in final excel sheet
+results<- all_results%>% select(-c(log_moi,log_volume)) 
+
+## rename column
+results %<>% 
+  rename(sample_name = sample_names)
+
+results %<>% 
+  dplyr::mutate(percent_discrepancy= 100*abs(volume_log_model-volume_linear_model)/pmin(volume_log_model,volume_linear_model)   ) 
+
+```
+
+## some QC plots
+expand prediction to smallest value of input viral volume as well..
+plot on log and linear scales.
+put points on the lines
+
+```{r ashish_additional_plot}
+ggplot() +
+  geom_point( data=linear_model_set,aes(x = viral_volume, y =MOI , color="data")) +
+  facet_wrap(~sample_name) +
+  geom_point(data = results, aes(x =volume_linear_model,  y =moi, color="linear_prediction"),shape=8 )+
+  geom_line(data = results, aes(x =volume_linear_model,  y =moi, color="linear_prediction"),shape=8 )+
+  geom_point(data = results, aes(x = volume_log_model, y = moi,color="log_prediction"))+
+  geom_line(data = results, aes(x = volume_log_model, y =moi, color="log_prediction"))+
+  scale_color_manual( values = c("data"="black","linear_prediction" = "blue", "log_prediction" = "red")) 
+
+ggsave(paste0("Preds_Linear_",date_of_file,".png" ))
+
+
+```
+
+```{r}
+
+ggplot() +
+  geom_point(data=linear_model_set, aes(x = viral_volume, y =MOI , color="data")) +
+  facet_wrap(~sample_name) +
+  geom_point(data = results, aes(x =volume_linear_model,  y =moi, color="linear_prediction"),shape=8 )+
+  geom_line(data = results, aes(x =volume_linear_model,  y =moi, color="linear_prediction") )+
+  geom_point(data = results, aes(x = volume_log_model, y = moi,color="log_prediction"),shape=8)+
+  geom_line(data = results, aes(x = volume_log_model, y =moi, color="log_prediction"))+
+  scale_color_manual( values = c("data"="black","linear_prediction" = "blue", "log_prediction" = "red")) +
+  scale_x_continuous(trans='log10') +scale_y_continuous(trans='log10') 
+
+
+ggsave(paste0("Preds_log-log_",date_of_file,".png" ))
+# scale_fill_discrete(labels=c('High Program', 'Low Program'))+
+
+
+
+```
+
+
+```{r}
+
+ggplot() +
+  geom_point(data=linear_model_set, aes(x = viral_volume, y =MOI , color="data")) +
+  facet_wrap(~sample_name) +
+  geom_point(data = results, aes(x =volume_linear_model,  y =moi, color="linear_prediction"),shape=8 )+
+  geom_line(data = results, aes(x =volume_linear_model,  y =moi, color="linear_prediction") )+
+  geom_point(data = results, aes(x = volume_log_model, y = moi,color="log_prediction"),shape=8)+
+  geom_line(data = results, aes(x = volume_log_model, y =moi, color="log_prediction"))+
+  scale_color_manual( values = c("data"="black","linear_prediction" = "blue", "log_prediction" = "red")) +
+  scale_x_continuous(trans='log10') 
+
+ggsave(paste0("Preds_semilog_",date_of_file,".png" ))
+```
+
+
+
+```{r}
+
+##Exports as a Excel Sheet. Make sure to change naming scheme to match titer data from the correct date
+## write.xlsx(list(results= results,all_results = all_results), "titer_data_20230223.xlsx")  
+
+## don't need allresults sheet and don't need results at all moi values predicted.
+results_to_report <-  results %>% 
+  dplyr::filter(moi %in% target_moi_for_report)
+
+write.xlsx( results_to_report, output_file_name) 
+
+
+```
+
